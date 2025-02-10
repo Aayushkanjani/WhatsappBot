@@ -1,4 +1,4 @@
 # Expense tracker bot
 Whatsapp Expense tracker bot
 
-For testing the code, just run app.py along with setting up the server.
+For testing the code, just enter groq api key and run app.py .
