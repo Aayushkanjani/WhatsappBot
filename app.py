@@ -7,6 +7,7 @@ import json
 import re
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
+from twilio.rest import Client
 
 app = Flask(__name__)
 CORS(app)
@@ -16,15 +17,30 @@ load_dotenv()
 # Groq API Configuration
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+account_sid =  os.getenv("account_sid")
+auth_token =  os.getenv("auth_token")
 
 # CSV File Path
 CSV_FILE = "expenses.csv"
+recipient = os.getenv("recipient") 
+
+
+# Initialize Twilio client (Make sure to set your credentials)
+client = Client(account_sid, auth_token) 
 
 # Ensure CSV file exists with headers
 if not os.path.exists(CSV_FILE):
     with open(CSV_FILE, mode="w", newline="") as file:
         writer = csv.writer(file)
         writer.writerow(["user_id", "amount", "category", "description", "date"])
+
+def send_whatsapp_message(to, message):
+    response = client.messages.create(
+        body=message,
+        from_="whatsapp:+14155238886",  # Twilio sandbox number
+        to=f"whatsapp:{to}"  # Pass recipient dynamically
+    )
+    return response.sid
 
 # Function to resolve relative dates
 def resolve_relative_date(date_str):
@@ -66,8 +82,9 @@ def classify_request_with_llama(message):
             {"role": "system", "content": """You are an assistant that determines if the user wants to *add* an expense or *query* past expenses.  
 
             - If the user is reporting a new expense (e.g., "I spent 100 on lunch", "Bought groceries for 500"), classify it as *'add'*.  
-            - If the user is asking about past expenses (e.g., "How much did I spend on food?", "Show my transactions"), classify it as *'query'*.  
-            - Respond with ONLY one word: *'add'* or *'query'*. Do not explain.  
+            - If the user is asking about past expenses (e.g., "How much did I spend on food?", "Show my transactions"), classify it as *'query'*.
+            - if the user is not asking query and not reporting a new expense , classify it as *'none'*.
+            - Respond with ONLY one word: *'add'* or *'query'* or *'none'*. Do not explain.  
             """},
             {"role": "user", "content": message}
         ]
@@ -115,11 +132,11 @@ def extract_query_term_with_llama(message):
             return None
     return None
 
-# ✅ Fetch filtered expenses (Checks Category + Description)
+#  Fetch filtered expenses (Checks Category + Description)
 def fetch_filtered_expenses(user_id, search_term):
     expenses = []
     transactions = []
-    search_term = search_term.replace('"', '').strip().lower()  # ✅ Fix extra quotes issue
+    search_term = search_term.replace('"', '').strip().lower()  
 
     print(f"🔍 Searching for: '{search_term}'")  # Debugging log
 
@@ -129,11 +146,11 @@ def fetch_filtered_expenses(user_id, search_term):
             if row["user_id"] == user_id:
                 category = row["category"].strip().lower()
                 description = row["description"].strip().lower()
+                date = row["date"].strip().lower()
+                print(f"📂 Checking row - Category: '{category}', Description: '{description}', Date: '{date}'")  # Debugging log
 
-                print(f"📂 Checking row - Category: '{category}', Description: '{description}'")  # Debugging log
-
-                # ✅ Match in either Category OR Description
-                if search_term in category or search_term in description:
+                # Match in either Category OR Description
+                if search_term in category or search_term in description or search_term in date:
                     amount = float(row["amount"])
                     expenses.append(amount)
                     transactions.append({
@@ -203,55 +220,91 @@ def save_expense_to_csv(user_id, amount, category, description, date):
         writer.writerow([user_id, amount, category, description, date])
 
 # Webhook to process WhatsApp messages
+from flask import request, jsonify
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
     try:
-        data = request.json
+        print(f"Headers: {request.headers}")
+        print(f"Raw Data: {request.data}")
 
-        if "messages" not in data:
-            return jsonify({"error": "Invalid payload"}), 400
+        # Handle Twilio's form-urlencoded data
+        if request.content_type == "application/x-www-form-urlencoded":
+            data = request.form.to_dict()
+        else:
+            data = request.get_json()
 
-        message_data = data["messages"][0]
-        user_id = message_data["from"]
-        message_text = message_data["text"]["body"]
+        print(f"Parsed Data: {data}")
 
-        print(f"Received Message: {message_text}")
+        message_text = data.get("Body", "")
+        user_id = data.get("From", "")
 
-        # Classify request type (add or query)
+        print(f"Received Message: {message_text} from {user_id}")
+
         request_type = classify_request_with_llama(message_text)
         print(f"Request Type: {request_type}")
 
         if request_type == "add":
             parsed_expense = parse_expense_with_llama(message_text)
+            print(f"Parsed Expense: {parsed_expense}")
+
             if parsed_expense:
-                amount = parsed_expense.get("amount")
-                category = parsed_expense.get("category")
-                description = parsed_expense.get("description")
-                date = parsed_expense.get("date")
+                amount = parsed_expense.get("amount", 0)
+                category = parsed_expense.get("category", "Unknown")
+                description = parsed_expense.get("description", "")
+                date = parsed_expense.get("date", str(datetime.now().date()))
 
-                save_expense_to_csv(user_id, amount, category, description, date)
-                
+                print(f"Amount: {amount}, Category: {category}, Description: {description}, Date: {date}")
+
+                try:
+                    save_expense_to_csv(user_id, amount, category, description, date)
+                    print("Expense saved successfully")
+                except Exception as e:
+                    print(f"Error saving expense: {e}")
+                    return jsonify({"error": "Failed to save expense"}), 500
+
+                try:
+                    send_whatsapp_message(recipient,"Expense added successfully ✅")
+                    print("WhatsApp message sent")
+                except Exception as e:
+                    print(f"Error sending WhatsApp message: {e}")
+                    return jsonify({"error": "Failed to send WhatsApp message"}), 500
+
                 return jsonify({"message": "Expense added"}), 200
-            
-            else:
-                return jsonify({"message": "Could not extract expense details. Please try again."}), 200
 
+            else:
+                print("Failed to parse expense")
+                return jsonify({"message": "Could not extract expense details"}), 400
 
         elif request_type == "query":
-            query_term = extract_query_term_with_llama(message_text)  
-            print(f"Extracted Query Term: {query_term}")  # Debugging log
-
+            query_term = extract_query_term_with_llama(message_text)
+            print(f"Extracted Query Term: {query_term}")
+            
             if query_term:
                 response_message = fetch_filtered_expenses(user_id, query_term)
+
+                try:
+                    send_whatsapp_message(recipient,response_message)
+                    print("Query response sent")
+                except Exception as e:
+                    print(f"Error sending WhatsApp message: {e}")
+                    return jsonify({"error": "Failed to send WhatsApp message"}), 500
+
                 return jsonify({"message": response_message}), 200
+
             else:
-                return jsonify({"message": "Could not identify expense category. Please try again."}), 200
+                return jsonify({"message": "Could not identify query term"}), 400
 
         else:
-            return jsonify({"message": "Could not classify your request. Please try again."}), 200
+            send_whatsapp_message(recipient,"I am here to help you manage your expenses!\nPlease enter or query valid expense😊")
+            print("Could not classify request")
+            return jsonify({"message": "Could not classify request"}), 400
 
     except Exception as e:
+        print(f"Unexpected Error: {e}")
         return jsonify({"error": str(e)}), 500
+
+
 
 if __name__ == "__main__":
     app.run(debug=True)
